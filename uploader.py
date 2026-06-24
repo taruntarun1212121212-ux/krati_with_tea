@@ -82,7 +82,7 @@ def close_log():
 #  LOGGER UPLOAD — upload log file to Google Drive
 # ══════════════════════════════════════════════════════════
 
-LOGS_FOLDER_ID = "1bniekPJ8HPIGOHAJK602KuhmQ5XmWKfB"
+LOGS_FOLDER_ID = "1uRKlio-uOcoINHLp-pu1NDlGNZmw4l6d"
 
 
 def upload_log_to_drive(drive):
@@ -109,7 +109,7 @@ def upload_log_to_drive(drive):
 # ══════════════════════════════════════════════════════════
 
 # ── Google Drive ──────────────────────────────────────────
-DRIVE_FOLDER_ID  = "1SkQgsJRR9G3lRYQlFzyR3wXz8gyjg4l3"
+DRIVE_FOLDER_ID  = "1HPmOJ9pS8wEYvdeBvBR3CpLMBYTFtd6G"
 DRIVE_IG_SCOPES  = ["https://www.googleapis.com/auth/drive"]
 
 # ── Instagram ─────────────────────────────────────────────
