@@ -27,9 +27,9 @@ Auth / env vars required:
   │ CLOUDINARY_CLOUD_NAME   │ Cloudinary cloud name                            │
   │ CLOUDINARY_API_KEY      │ Cloudinary API key                               │
   │ CLOUDINARY_API_SECRET   │ Cloudinary API secret                            │
-  │ GITHUB_PAT              │ GitHub Personal Access Token (needs repo scope)  │
-  │ GITHUB_REPO             │ Repo in "username/repo-name" format              │
-  │ GITHUB_JSON_PATH        │ Path inside repo, e.g. "data/processed.json"    │
+  │ GH_PAT              │ GitHub Personal Access Token (needs repo scope)  │
+  │ GH_REPO             │ Repo in "username/repo-name" format              │
+  │ GH_JSON_PATH        │ Path inside repo, e.g. "data/processed.json"    │
   └─────────────────────────┴──────────────────────────────────────────────────┘
 """
 
@@ -140,9 +140,9 @@ cloudinary.config(
 )
 
 # ── GitHub JSON tracker ───────────────────────────────────
-GITHUB_PAT       = os.environ["GITHUB_PAT"]
-GITHUB_REPO      = os.environ["GITHUB_REPO"]        # e.g. "john/video-tracker"
-GITHUB_JSON_PATH = os.environ["GITHUB_JSON_PATH"]   # e.g. "data/processed_videos.json"
+GH_PAT           = os.environ["GH_PAT"]
+GH_REPO          = os.environ["GH_REPO"]        # e.g. "john/video-tracker"
+GH_JSON_PATH     = os.environ["GH_JSON_PATH"]   # e.g. "data/processed_videos.json"
 GITHUB_API_BASE  = "https://api.github.com"
 
 
@@ -513,11 +513,11 @@ def append_to_github_json(drive_file_id, drive_file_name, ig_post_id, fb_video_i
     log("📝 Updating GitHub JSON tracker...")
 
     headers = {
-        "Authorization": f"Bearer {GITHUB_PAT}",
+        "Authorization": f"Bearer {GH_PAT}",
         "Accept":        "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO}/contents/{GITHUB_JSON_PATH}"
+    url = f"{GITHUB_API_BASE}/repos/{GH_REPO}/contents/{GH_JSON_PATH}"
 
     # ── Try to fetch existing file ────────────────────────
     get_resp = requests.get(url, headers=headers)
@@ -569,7 +569,7 @@ def append_to_github_json(drive_file_id, drive_file_name, ig_post_id, fb_video_i
 
     if put_resp.status_code in (200, 201):
         action = "updated" if sha else "created"
-        log(f"✅ GitHub JSON {action}: {GITHUB_REPO}/{GITHUB_JSON_PATH}")
+        log(f"✅ GitHub JSON {action}: {GH_REPO}/{GH_JSON_PATH}")
     else:
         log(f"❌ GitHub push failed ({put_resp.status_code}): {put_resp.text}")
 
@@ -705,7 +705,7 @@ def main():
     log(f"  File processed : {file_name}")
     log(f"  Instagram Reel : {'✅ ' + str(ig_post_id) if ig_post_id else '❌ Failed'}")
     log(f"  Facebook Reel  : {'✅ Video ID ' + str(fb_video_id) if fb_video_id else '❌ Failed'}")
-    log(f"  GitHub JSON    : {GITHUB_REPO}/{GITHUB_JSON_PATH}")
+    log(f"  GitHub JSON    : {GH_REPO}/{GH_JSON_PATH}")
     log(f"  Log saved to   : {LOG_FILE}")
     log("=" * 55)
     _log_handle.flush()
