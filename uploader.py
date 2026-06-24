@@ -2,8 +2,8 @@
 Unified Auto-Uploader: Instagram Reels + Facebook Reels
 ---------------------------------------------------------
 Flow for each video:
-  1. List & sort .mp4 files from Google Drive (Reel project credentials)
-  2. Download the first file locally
+  1. Read Google Sheet to get next unprocessed video (S No, Timestamp, Drive ID)
+  2. Download the file from Google Drive using the ID from sheet
   3. Convert to 9:16 (1080x1920) with blurred background via FFmpeg
   4. Upload converted file to Cloudinary
   5. Publish to Instagram Reels via Cloudinary URL
@@ -18,8 +18,9 @@ Auth / env vars required:
   ┌─────────────────────────┬──────────────────────────────────────────────────┐
   │ Env var                 │ What it is                                       │
   ├─────────────────────────┼──────────────────────────────────────────────────┤
-  │ GOOGLE_TOKEN            │ Full JSON content of token.json (Drive + IG      │
-  │                         │ project — Reel project)                          │
+  │ GOOGLE_TOKEN            │ Full JSON content of token.json (Drive + Sheets) │
+  │ SPREADSHEET_ID          │ Google Sheet ID (from its URL)                   │
+  │ SHEET_NAME              │ Sheet tab name, e.g. "Sheet1"                    │
   │ IG_ACCESS_TOKEN         │ Instagram Graph API user access token            │
   │ IG_ID                   │ Instagram Business / Creator account ID          │
   │ FB_ACCESS_TOKEN         │ Facebook Page access token (long-lived)          │
@@ -27,10 +28,15 @@ Auth / env vars required:
   │ CLOUDINARY_CLOUD_NAME   │ Cloudinary cloud name                            │
   │ CLOUDINARY_API_KEY      │ Cloudinary API key                               │
   │ CLOUDINARY_API_SECRET   │ Cloudinary API secret                            │
-  │ GH_PAT              │ GitHub Personal Access Token (needs repo scope)  │
-  │ GH_REPO             │ Repo in "username/repo-name" format              │
-  │ GH_JSON_PATH        │ Path inside repo, e.g. "data/processed.json"    │
+  │ GH_PAT                  │ GitHub Personal Access Token (needs repo scope)  │
+  │ GH_REPO                 │ Repo in "username/repo-name" format              │
+  │ GH_JSON_PATH            │ Path inside repo, e.g. "data/processed.json"    │
   └─────────────────────────┴──────────────────────────────────────────────────┘
+
+Google Sheet format expected:
+  Column A: S No       (1, 2, 3 ...)
+  Column B: Time Stamp (2026-06-24 23:05:03)
+  Column C: Id         (Google Drive file ID)
 """
 
 import os
@@ -108,9 +114,15 @@ def upload_log_to_drive(drive):
 #  CONFIGURATION
 # ══════════════════════════════════════════════════════════
 
-# ── Google Drive ──────────────────────────────────────────
-DRIVE_FOLDER_ID  = "1HPmOJ9pS8wEYvdeBvBR3CpLMBYTFtd6G"
-DRIVE_IG_SCOPES  = ["https://www.googleapis.com/auth/drive"]
+# ── Google Sheets ─────────────────────────────────────────
+SPREADSHEET_ID ="1qMLiGlLFfXDpQ49GfpezpAC7ppFBJYBjA62wO3NNoUs"
+SHEET_NAME     = os.environ.get("SHEET_NAME", "Sheet1")  # Tab name, default Sheet1
+
+# ── Google Drive / Sheets scopes ─────────────────────────
+DRIVE_SCOPES = [
+    "https://www.googleapis.com/auth/drive",
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+]
 
 # ── Instagram ─────────────────────────────────────────────
 IG_ACCESS_TOKEN = os.environ["IG_ACCESS_TOKEN"]
@@ -165,80 +177,131 @@ def check_ffmpeg():
 #  AUTH
 # ══════════════════════════════════════════════════════════
 
-def get_drive_ig_service():
+def get_google_services():
     """
-    Drive + Instagram auth.
-    Uses GOOGLE_TOKEN env var (Reel project token.json content).
+    Authenticate with Google and return (drive_service, sheets_service).
+    Uses GOOGLE_TOKEN env var (full token.json content).
     """
     creds = Credentials.from_authorized_user_info(
         json.loads(os.environ["GOOGLE_TOKEN"]),
-        DRIVE_IG_SCOPES,
+        DRIVE_SCOPES,
     )
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
 
-    drive = build("drive", "v3", credentials=creds)
-    return drive
+    drive  = build("drive",  "v3", credentials=creds)
+    sheets = build("sheets", "v4", credentials=creds)
+    return drive, sheets
 
 
 # ══════════════════════════════════════════════════════════
-#  STEP 1 — LIST FILES FROM DRIVE
+#  STEP 1 — READ VIDEO ID FROM GOOGLE SHEET
 # ══════════════════════════════════════════════════════════
 
-def sort_key(filename):
-    """Sort by numeric pattern: '1 (2)_clip3' → (1, 2, 3). Others go last."""
-    match = re.match(r"(\d+)\s*\((\d+)\)_clip(\d+)", filename)
-    if match:
-        return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
-    return (999, 999, 999)
-
-
-def fetch_drive_videos(drive):
+def fetch_next_video_from_sheet(sheets, processed_ids: set):
     """
-    Fetch all .mp4 files from the Drive folder (with pagination).
-    Returns the first file sorted by filename pattern, or None.
+    Read all rows from the Google Sheet and return the first row
+    whose Drive ID has NOT been processed yet.
+
+    Sheet columns (row 1 = header, data starts row 2):
+      A: S No | B: Time Stamp | C: Id
+
+    Returns dict: { "s_no": "1", "timestamp": "...", "drive_id": "..." }
+    or None if nothing is left to process.
     """
-    log("📂 Fetching video list from Google Drive...")
+    log(f"📋 Reading Google Sheet: {SPREADSHEET_ID} / {SHEET_NAME}")
 
-    query      = f"'{DRIVE_FOLDER_ID}' in parents and trashed=false"
-    all_files  = []
-    page_token = None
+    range_name = f"{SHEET_NAME}!A:C"
+    result = (
+        sheets.spreadsheets()
+        .values()
+        .get(spreadsheetId=SPREADSHEET_ID, range=range_name)
+        .execute()
+    )
+    rows = result.get("values", [])
 
-    while True:
-        params = {
-            "q":        query,
-            "fields":   "nextPageToken, files(id, name, mimeType)",
-            "pageSize": 1000,
-        }
-        if page_token:
-            params["pageToken"] = page_token
-
-        results    = drive.files().list(**params).execute()
-        all_files += results.get("files", [])
-        page_token = results.get("nextPageToken")
-        if not page_token:
-            break
-
-    mp4_files = [f for f in all_files if f["name"].lower().endswith(".mp4")]
-
-    if not mp4_files:
-        log("⚠️  No .mp4 files found in Drive folder.")
+    if not rows or len(rows) < 2:
+        log("⚠️  Sheet is empty or has only a header row.")
         return None
 
-    sorted_files = sorted(mp4_files, key=lambda f: sort_key(f["name"]))
-    target       = sorted_files[0]
+    header = rows[0]  # ['S No', 'Time Stamp', 'Id']
+    log(f"   Sheet header: {header}")
+    log(f"   Total data rows: {len(rows) - 1}")
 
-    log(f"   Found {len(mp4_files)} file(s). Processing first: {target['name']}")
-    return target
+    for row in rows[1:]:
+        if len(row) < 3:
+            continue  # skip incomplete rows
+
+        s_no      = row[0].strip()
+        timestamp = row[1].strip()
+        drive_id  = row[2].strip()
+
+        if not drive_id:
+            continue
+
+        if drive_id in processed_ids:
+            log(f"   ⏭️  Row {s_no} ({drive_id}) already processed — skipping.")
+            continue
+
+        log(f"   ✅ Next video to process → Row {s_no} | {timestamp} | {drive_id}")
+        return {"s_no": s_no, "timestamp": timestamp, "drive_id": drive_id}
+
+    log("⚠️  All rows in sheet have already been processed.")
+    return None
+
+
+# ══════════════════════════════════════════════════════════
+#  HELPER — LOAD ALREADY-PROCESSED IDs FROM GITHUB JSON
+# ══════════════════════════════════════════════════════════
+
+def load_processed_ids_from_github() -> set:
+    """
+    Fetch the GitHub JSON tracker and return a set of drive_file_ids
+    that have already been processed. Returns empty set if file doesn't exist.
+    """
+    headers = {
+        "Authorization": f"Bearer {GH_PAT}",
+        "Accept":        "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    url      = f"{GITHUB_API_BASE}/repos/{GH_REPO}/contents/{GH_JSON_PATH}"
+    response = requests.get(url, headers=headers)
+
+    if response.status_code == 404:
+        log("   GitHub JSON tracker not found — treating all rows as unprocessed.")
+        return set()
+
+    if response.status_code != 200:
+        log(f"⚠️  Could not fetch GitHub JSON ({response.status_code}) — assuming no prior runs.")
+        return set()
+
+    file_data = response.json()
+    content   = base64.b64decode(file_data["content"]).decode("utf-8")
+
+    try:
+        records = json.loads(content)
+        if not isinstance(records, list):
+            return set()
+        ids = {r["drive_file_id"] for r in records if "drive_file_id" in r}
+        log(f"   Found {len(ids)} previously processed Drive ID(s) in GitHub tracker.")
+        return ids
+    except (json.JSONDecodeError, KeyError):
+        return set()
 
 
 # ══════════════════════════════════════════════════════════
 #  STEP 2 — DOWNLOAD FROM DRIVE
 # ══════════════════════════════════════════════════════════
 
+def get_file_name_from_drive(drive, file_id):
+    """Fetch the file name from Drive metadata."""
+    meta = drive.files().get(fileId=file_id, fields="name").execute()
+    return meta.get("name", f"{file_id}.mp4")
+
+
 def download_from_drive(drive, file_id, file_name):
     """Download Drive file to a local temp .mp4. Returns temp file path."""
-    log(f"⬇️  Downloading: {file_name}")
+    log(f"⬇️  Downloading: {file_name} ({file_id})")
     request = drive.files().get_media(fileId=file_id)
 
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
@@ -262,16 +325,6 @@ def download_from_drive(drive, file_id, file_name):
 def convert_to_vertical(input_path):
     """
     Convert video to 1080x1920 (9:16) with blurred background.
-
-    Layout:
-    ┌──────────────────┐
-    │  blurred enlarged│  ← bg: original scaled to cover + gblur
-    │  ┌────────────┐  │
-    │  │  original  │  │  ← fg: original scaled to fit, centered
-    │  │   video    │  │
-    │  └────────────┘  │
-    │  blurred enlarged│
-    └──────────────────┘
     """
     log("🎨 Converting to 9:16 with blurred background...")
 
@@ -403,12 +456,6 @@ def publish_instagram_reel(video_url):
 def publish_facebook_reel(video_url):
     """
     Publish a Facebook Reel to a Page using the video_reels endpoint.
-
-    Flow:
-      A. Initialize upload session → get video_id + upload_url
-      B. Upload the video bytes via PUT to upload_url
-      C. Publish using /{page_id}/video_reels with PUBLISHED status
-
     Returns the Facebook video/post ID or None on failure.
     """
 
@@ -436,7 +483,6 @@ def publish_facebook_reel(video_url):
     # ── B. Download Cloudinary video and PUT to Facebook ─
     log("⬆️  Uploading video bytes to Facebook...")
 
-    # Stream the Cloudinary URL directly into the Facebook upload PUT
     with requests.get(video_url, stream=True) as dl:
         dl.raise_for_status()
         upload_resp = requests.put(
@@ -444,10 +490,9 @@ def publish_facebook_reel(video_url):
             headers={
                 "Authorization":  f"OAuth {FB_ACCESS_TOKEN}",
                 "Content-Type":   "application/octet-stream",
-                # Content-Length is required by Facebook's resumable uploader
                 "Content-Length": dl.headers.get("Content-Length", ""),
             },
-            data=dl.iter_content(chunk_size=1024 * 1024),  # 1 MB chunks
+            data=dl.iter_content(chunk_size=1024 * 1024),
             stream=True,
         )
 
@@ -472,7 +517,6 @@ def publish_facebook_reel(video_url):
     )
     pub_data = pub_resp.json()
 
-    # Facebook returns {"success": true} on publish; the video_id is the post reference
     if pub_data.get("success"):
         log(f"✅ Facebook Reel published! Video ID: {video_id}")
         return video_id
@@ -500,15 +544,6 @@ def append_to_github_json(drive_file_id, drive_file_name, ig_post_id, fb_video_i
     """
     Read the JSON tracking file from GitHub (creates it if absent),
     append a new record for this session, and push the updated file back.
-
-    Record schema:
-    {
-        "drive_file_id":   "...",
-        "drive_file_name": "...",
-        "ig_post_id":      "..." | null,
-        "fb_video_id":     "..." | null,
-        "timestamp":       "YYYY-MM-DD HH:MM:SS"
-    }
     """
     log("📝 Updating GitHub JSON tracker...")
 
@@ -519,7 +554,6 @@ def append_to_github_json(drive_file_id, drive_file_name, ig_post_id, fb_video_i
     }
     url = f"{GITHUB_API_BASE}/repos/{GH_REPO}/contents/{GH_JSON_PATH}"
 
-    # ── Try to fetch existing file ────────────────────────
     get_resp = requests.get(url, headers=headers)
     sha      = None
     records  = []
@@ -543,7 +577,6 @@ def append_to_github_json(drive_file_id, drive_file_name, ig_post_id, fb_video_i
         log("   Skipping GitHub update — record NOT saved.")
         return
 
-    # ── Append new record ─────────────────────────────────
     new_record = {
         "drive_file_id":   drive_file_id,
         "drive_file_name": drive_file_name,
@@ -554,7 +587,6 @@ def append_to_github_json(drive_file_id, drive_file_name, ig_post_id, fb_video_i
     records.append(new_record)
     log(f"   Appending record: {new_record}")
 
-    # ── Push updated file back to GitHub ──────────────────
     updated_content = json.dumps(records, indent=2, ensure_ascii=False)
     encoded_content = base64.b64encode(updated_content.encode("utf-8")).decode("utf-8")
 
@@ -563,7 +595,7 @@ def append_to_github_json(drive_file_id, drive_file_name, ig_post_id, fb_video_i
         "content": encoded_content,
     }
     if sha:
-        push_body["sha"] = sha   # required for updates; omit only for new file
+        push_body["sha"] = sha
 
     put_resp = requests.put(url, headers=headers, json=push_body)
 
@@ -601,22 +633,32 @@ def main():
     # ── Pre-flight checks ────────────────────────────────
     check_ffmpeg()
 
-    # ── Authenticate Drive ───────────────────────────────
-    log("\n🔐 Authenticating Drive / Instagram (Reel project)...")
-    drive = get_drive_ig_service()
+    # ── Authenticate Google (Drive + Sheets) ─────────────
+    log("\n🔐 Authenticating Google services...")
+    drive, sheets = get_google_services()
 
-    # ── Fetch first video from Drive ─────────────────────
+    # ── Load already-processed IDs from GitHub ───────────
+    log("\n📦 Loading previously processed Drive IDs from GitHub...")
+    processed_ids = load_processed_ids_from_github()
+
+    # ── Step 1: Read next video from Google Sheet ─────────
     log("\n" + "─" * 55)
-    target = fetch_drive_videos(drive)
-    if not target:
+    row = fetch_next_video_from_sheet(sheets, processed_ids)
+
+    if not row:
         log("Nothing to do. Exiting.")
         _log_handle.flush()
         upload_log_to_drive(drive)
         close_log()
         return
 
-    file_id   = target["id"]
-    file_name = target["name"]
+    file_id   = row["drive_id"]
+    s_no      = row["s_no"]
+    sheet_ts  = row["timestamp"]
+
+    # Get the actual filename from Drive metadata
+    file_name = get_file_name_from_drive(drive, file_id)
+    log(f"   Drive file name: {file_name}")
 
     # Tracking vars
     raw_path       = None
@@ -626,7 +668,7 @@ def main():
     fb_video_id    = None
 
     try:
-        # ── Step 2: Download ──────────────────────────────
+        # ── Step 2: Download from Drive ───────────────────
         log("\n" + "─" * 55)
         raw_path = download_from_drive(drive, file_id, file_name)
 
@@ -678,7 +720,6 @@ def main():
                 log(f"⚠️  Cloudinary delete failed — manual cleanup may be needed. Reason: {e}")
 
         # ── Step 8: Append record to GitHub JSON ──────────
-        # Runs regardless of whether uploads succeeded, so every attempt is logged
         log("\n" + "─" * 55)
         try:
             append_to_github_json(file_id, file_name, ig_post_id, fb_video_id)
@@ -702,7 +743,9 @@ def main():
     log("\n" + "=" * 55)
     log("  📊 SESSION SUMMARY")
     log("=" * 55)
-    log(f"  File processed : {file_name}")
+    log(f"  Sheet Row      : {s_no} | {sheet_ts}")
+    log(f"  Drive File ID  : {file_id}")
+    log(f"  File Name      : {file_name}")
     log(f"  Instagram Reel : {'✅ ' + str(ig_post_id) if ig_post_id else '❌ Failed'}")
     log(f"  Facebook Reel  : {'✅ Video ID ' + str(fb_video_id) if fb_video_id else '❌ Failed'}")
     log(f"  GitHub JSON    : {GH_REPO}/{GH_JSON_PATH}")
