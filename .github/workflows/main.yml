@@ -2,13 +2,13 @@ name: Upload Instagram Reel + Facebook Reel
 on:
   schedule:
     # 8:00 PM IST
-    # - cron: '20 14 * * *'
+    - cron: '20 14 * * *'
     # # 10:00 PM IST
-    # - cron: '30 16 * * *'
+    - cron: '30 16 * * *'
     # 12:00 AM IST
-    - cron: '30 22 * * *'
+    # - cron: '30 22 * * *'
     # 1:00 AM IST
-    - cron: '30 23 * * *'
+    # - cron: '30 23 * * *'
   workflow_dispatch:
 jobs:
   upload:
